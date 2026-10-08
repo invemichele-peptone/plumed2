@@ -199,7 +199,7 @@ private:
 
   double threshold2_;
   bool recursive_merge_;
-//kernels are truncated diagonal Gaussians
+//kernels are truncated diagonal Gaussians, force-shifted so that value and derivative vanish at the cutoff
   struct kernel {
     double height;
     std::vector<double> center;
@@ -1667,7 +1667,8 @@ inline double OPESmetad<mode>::evaluateKernel(const kernel& G,const std::vector<
       return 0;
     }
   }
-  return G.height*(std::exp(-0.5*norm2)-val_at_cutoff_);
+  //force-shifted Gaussian: both the kernel and its derivative go to zero at the cutoff
+  return G.height*(std::exp(-0.5*norm2)-val_at_cutoff_*(1+0.5*(cutoff2_-norm2)));
 }
 
 template <class mode>
@@ -1681,11 +1682,13 @@ inline double OPESmetad<mode>::evaluateKernel(const kernel& G,const std::vector<
       return 0;
     }
   }
-  const double val=G.height*(std::exp(-0.5*norm2)-val_at_cutoff_);
+  //force-shifted Gaussian, G*(exp(-r2/2)-c*(1+(rc2-r2)/2)) with c=exp(-rc2/2):
+  //its derivative is -G*(exp(-r2/2)-c)*dr2/2, continuous at the cutoff
+  const double der_val=G.height*(std::exp(-0.5*norm2)-val_at_cutoff_);
   for(unsigned i=0; i<ncv_; i++) {
-    acc_der[i]-=dist[i]/G.sigma[i]*val;  //NB: we accumulate the derivative into der
+    acc_der[i]-=dist[i]/G.sigma[i]*der_val;  //NB: we accumulate the derivative into der
   }
-  return val;
+  return der_val-G.height*val_at_cutoff_*0.5*(cutoff2_-norm2);
 }
 
 template <class mode>
