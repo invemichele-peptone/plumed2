@@ -1696,10 +1696,15 @@ inline void OPESmetad<mode>::mergeKernels(kernel& k1,const kernel& k2) {
     if(isPeriodic_i) {
       k1.center[i]=k2.center[i]+difference(i,k2.center[i],k1.center[i]);  //fix PBC
     }
-    const double c_i=(k1.height*k1.center[i]+k2.height*k2.center[i])/h;
-    const double ss_k1_part=k1.height*(k1.sigma[i]*k1.sigma[i]+k1.center[i]*k1.center[i]);
-    const double ss_k2_part=k2.height*(k2.sigma[i]*k2.sigma[i]+k2.center[i]*k2.center[i]);
-    const double ss_i=(ss_k1_part+ss_k2_part)/h-c_i*c_i;
+    const double w1=k1.height/h;
+    const double w2=k2.height/h;
+    const double delta=k2.center[i]-k1.center[i];
+    const double c_i=k1.center[i]+w2*delta;
+    // Merge centered second moments. Subtracting E[x]^2 from E[x^2]
+    // loses the width for narrow kernels far from the CV origin and can
+    // produce zero or negative variance from entirely finite input.
+    const double ss_i=w1*k1.sigma[i]*k1.sigma[i]+
+                      w2*k2.sigma[i]*k2.sigma[i]+w1*w2*delta*delta;
     if(isPeriodic_i) {
       k1.center[i]=bringBackInPbc(i,c_i);
     } else {
