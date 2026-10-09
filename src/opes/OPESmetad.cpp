@@ -199,7 +199,8 @@ private:
 
   double threshold2_;
   bool recursive_merge_;
-  bool merge_split_; //merge the weights (height times normalization) instead of the heights
+  bool merge_mass_weights_; //centre and variance of a merge are weighted by the kernel mass, not the height
+  bool merge_conserve_mass_; //the merged height conserves the mass, instead of the sum of heights
   enum class cutoffScheme {plain,pr,alternative};
   cutoffScheme cutoff_scheme_;
 //kernels are truncated diagonal Gaussians, see CUTOFF_SCHEME for how the truncation is done
@@ -338,7 +339,9 @@ void OPESmetad<mode>::registerKeywords(Keywords& keys) {
   keys.add("compulsory","MERGE_SCHEME","PLAIN","how kernels are merged during compression. "
            "PLAIN: the heights are summed (v2.9). "
            "SPLIT: the weights, i.e. the heights times the kernel normalization, are summed "
-           "and the merged height is recomputed from the merged sigma, preserving the total mass of the KDE");
+           "and the merged height is recomputed from the merged sigma, preserving the total mass of the KDE. "
+           "Two hybrids, for diagnostics: MASS (centre and variance as PLAIN, height conserving the mass) "
+           "and SHAPE (centre and variance as SPLIT, heights summed as PLAIN)");
   keys.add("optional","NLIST_PARAMETERS","( default=3.0,0.5 ) the two cutoff parameters for the kernels neighbor list");
   keys.addFlag("NLIST",false,"use neighbor list for kernels summation, faster but experimental");
   keys.addFlag("NLIST_PACE_RESET",false,"force the reset of the neighbor list at each PACE. Can be useful with WALKERS_MPI");
@@ -487,8 +490,10 @@ OPESmetad<mode>::OPESmetad(const ActionOptions& ao)
   }
   std::string merge_scheme;
   parse("MERGE_SCHEME",merge_scheme);
-  plumed_massert(merge_scheme=="PLAIN" || merge_scheme=="SPLIT","MERGE_SCHEME must be PLAIN or SPLIT");
-  merge_split_=(merge_scheme=="SPLIT");
+  plumed_massert(merge_scheme=="PLAIN" || merge_scheme=="SPLIT" || merge_scheme=="MASS" || merge_scheme=="SHAPE",
+                 "MERGE_SCHEME must be PLAIN, SPLIT, MASS or SHAPE");
+  merge_mass_weights_=(merge_scheme=="SPLIT" || merge_scheme=="SHAPE");
+  merge_conserve_mass_=(merge_scheme=="SPLIT" || merge_scheme=="MASS");
 
   threshold2_=1;
   parse("COMPRESSION_THRESHOLD",threshold2_);
@@ -1736,16 +1741,21 @@ inline double OPESmetad<mode>::evaluateKernel(const kernel& G,const std::vector<
 
 template <class mode>
 inline void OPESmetad<mode>::mergeKernels(kernel& k1,const kernel& k2) {
-  //the merge preserves the mass, mean and variance of the two kernels. With MERGE_SCHEME=PLAIN
-  //the mass is the height, with SPLIT it is the height times the kernel normalization
-  //(prod_i sigma_i, up to a constant factor), i.e. the weight of the kernel in the KDE
+  //the mass of a kernel is its height times the normalization prod_i sigma_i (up to a constant),
+  //i.e. its weight in the KDE. SPLIT weights centre and variance by the mass and conserves it,
+  //PLAIN uses the heights for both; MASS and SHAPE mix the two, for diagnostics
   double m1=k1.height;
   double m2=k2.height;
-  if(merge_split_) {
+  if(merge_mass_weights_ || merge_conserve_mass_) {
     for(unsigned i=0; i<k1.center.size(); i++) {
       m1*=k1.sigma[i];
       m2*=k2.sigma[i];
     }
+  }
+  const double mass=m1+m2;
+  if(!merge_mass_weights_) {
+    m1=k1.height;
+    m2=k2.height;
   }
   const double m=m1+m2;
   for(unsigned i=0; i<k1.center.size(); i++) {
@@ -1769,14 +1779,14 @@ inline void OPESmetad<mode>::mergeKernels(kernel& k1,const kernel& k2) {
     }
     k1.sigma[i]=sqrt(ss_i);
   }
-  if(merge_split_) {
+  if(merge_conserve_mass_) {
     double norm=1;
     for(unsigned i=0; i<k1.center.size(); i++) {
       norm*=k1.sigma[i];
     }
-    k1.height=m/norm;
+    k1.height=mass/norm;
   } else {
-    k1.height=m;
+    k1.height=k1.height+k2.height;
   }
 }
 
