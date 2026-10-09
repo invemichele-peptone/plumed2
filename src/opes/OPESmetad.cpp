@@ -199,7 +199,10 @@ private:
 
   double threshold2_;
   bool recursive_merge_;
-//kernels are truncated diagonal Gaussians, force-shifted so that value and derivative vanish at the cutoff
+  bool merge_split_; //merge the weights (height times normalization) instead of the heights
+  enum class cutoffScheme {plain,pr,alternative};
+  cutoffScheme cutoff_scheme_;
+//kernels are truncated diagonal Gaussians, see CUTOFF_SCHEME for how the truncation is done
   struct kernel {
     double height;
     std::vector<double> center;
@@ -328,6 +331,14 @@ void OPESmetad<mode>::registerKeywords(Keywords& keys) {
   keys.add("optional","BIASFACTOR",info_biasfactor);
   keys.add("optional","EPSILON","the value of the regularization constant for the probability");
   keys.add("optional","KERNEL_CUTOFF","truncate kernels at this distance, in units of sigma");
+  keys.add("compulsory","CUTOFF_SCHEME","PLAIN","how kernels are truncated at KERNEL_CUTOFF. "
+           "PLAIN: energy-shifted value, with the derivative of the force-shifted kernel (v2.9). "
+           "PR: energy-shifted value and its derivative, which jumps at the cutoff (plumed2#1463). "
+           "ALTERNATIVE: force-shifted value and derivative, both continuous at the cutoff");
+  keys.add("compulsory","MERGE_SCHEME","PLAIN","how kernels are merged during compression. "
+           "PLAIN: the heights are summed (v2.9). "
+           "SPLIT: the weights, i.e. the heights times the kernel normalization, are summed "
+           "and the merged height is recomputed from the merged sigma, preserving the total mass of the KDE");
   keys.add("optional","NLIST_PARAMETERS","( default=3.0,0.5 ) the two cutoff parameters for the kernels neighbor list");
   keys.addFlag("NLIST",false,"use neighbor list for kernels summation, faster but experimental");
   keys.addFlag("NLIST_PACE_RESET",false,"force the reset of the neighbor list at each PACE. Can be useful with WALKERS_MPI");
@@ -463,6 +474,21 @@ OPESmetad<mode>::OPESmetad(const ActionOptions& ao)
   plumed_massert(cutoff>0,"you must choose a value for KERNEL_CUTOFF greater than zero");
   cutoff2_=cutoff*cutoff;
   val_at_cutoff_=std::exp(-0.5*cutoff2_);
+  std::string cutoff_scheme;
+  parse("CUTOFF_SCHEME",cutoff_scheme);
+  if(cutoff_scheme=="PLAIN") {
+    cutoff_scheme_=cutoffScheme::plain;
+  } else if(cutoff_scheme=="PR") {
+    cutoff_scheme_=cutoffScheme::pr;
+  } else if(cutoff_scheme=="ALTERNATIVE") {
+    cutoff_scheme_=cutoffScheme::alternative;
+  } else {
+    plumed_merror("CUTOFF_SCHEME must be PLAIN, PR or ALTERNATIVE");
+  }
+  std::string merge_scheme;
+  parse("MERGE_SCHEME",merge_scheme);
+  plumed_massert(merge_scheme=="PLAIN" || merge_scheme=="SPLIT","MERGE_SCHEME must be PLAIN or SPLIT");
+  merge_split_=(merge_scheme=="SPLIT");
 
   threshold2_=1;
   parse("COMPRESSION_THRESHOLD",threshold2_);
@@ -891,11 +917,13 @@ OPESmetad<mode>::OPESmetad(const ActionOptions& ao)
     log.printf(" +++ WARNING +++ probably kernels are truncated too much\n");
   }
   log.printf("  the value at cutoff is = %g\n",val_at_cutoff_);
+  log.printf("  CUTOFF_SCHEME = %s\n",cutoff_scheme.c_str());
   log.printf("  regularization EPSILON = %g\n",epsilon_);
   if(val_at_cutoff_>epsilon_*(1+1e-6)) {
     log.printf(" +++ WARNING +++ the KERNEL_CUTOFF might be too small for the given EPSILON\n");
   }
   log.printf("  kernels will be compressed when closer than COMPRESSION_THRESHOLD = %g\n",sqrt(threshold2_));
+  log.printf("  MERGE_SCHEME = %s\n",merge_scheme.c_str());
   if(threshold2_==0) {
     log.printf(" +++ WARNING +++ kernels will never merge, expect slowdowns\n");
   }
@@ -1667,8 +1695,10 @@ inline double OPESmetad<mode>::evaluateKernel(const kernel& G,const std::vector<
       return 0;
     }
   }
-  //force-shifted Gaussian: both the kernel and its derivative go to zero at the cutoff
-  return G.height*(std::exp(-0.5*norm2)-val_at_cutoff_*(1+0.5*(cutoff2_-norm2)));
+  if(cutoff_scheme_==cutoffScheme::alternative) { //force-shifted Gaussian
+    return G.height*(std::exp(-0.5*norm2)-val_at_cutoff_*(1+0.5*(cutoff2_-norm2)));
+  }
+  return G.height*(std::exp(-0.5*norm2)-val_at_cutoff_); //energy-shifted Gaussian
 }
 
 template <class mode>
@@ -1682,25 +1712,49 @@ inline double OPESmetad<mode>::evaluateKernel(const kernel& G,const std::vector<
       return 0;
     }
   }
-  //force-shifted Gaussian, G*(exp(-r2/2)-c*(1+(rc2-r2)/2)) with c=exp(-rc2/2):
-  //its derivative is -G*(exp(-r2/2)-c)*dr2/2, continuous at the cutoff
-  const double der_val=G.height*(std::exp(-0.5*norm2)-val_at_cutoff_);
+  //with c=exp(-rc2/2), the energy-shifted kernel is G*(exp(-r2/2)-c) and the force-shifted one is
+  //G*(exp(-r2/2)-c*(1+(rc2-r2)/2)), whose derivative -G*(exp(-r2/2)-c)*dr2/2 vanishes at the cutoff
+  double val, der_val;
+  switch(cutoff_scheme_) {
+  case cutoffScheme::pr: //energy-shifted value and its exact derivative
+    der_val=G.height*std::exp(-0.5*norm2);
+    val=der_val-G.height*val_at_cutoff_;
+    break;
+  case cutoffScheme::alternative: //force-shifted value and its exact derivative
+    der_val=G.height*(std::exp(-0.5*norm2)-val_at_cutoff_);
+    val=der_val-G.height*val_at_cutoff_*0.5*(cutoff2_-norm2);
+    break;
+  default: //energy-shifted value, derivative of the force-shifted kernel
+    val=G.height*(std::exp(-0.5*norm2)-val_at_cutoff_);
+    der_val=val;
+  }
   for(unsigned i=0; i<ncv_; i++) {
     acc_der[i]-=dist[i]/G.sigma[i]*der_val;  //NB: we accumulate the derivative into der
   }
-  return der_val-G.height*val_at_cutoff_*0.5*(cutoff2_-norm2);
+  return val;
 }
 
 template <class mode>
 inline void OPESmetad<mode>::mergeKernels(kernel& k1,const kernel& k2) {
-  const double h=k1.height+k2.height;
+  //the merge preserves the mass, mean and variance of the two kernels. With MERGE_SCHEME=PLAIN
+  //the mass is the height, with SPLIT it is the height times the kernel normalization
+  //(prod_i sigma_i, up to a constant factor), i.e. the weight of the kernel in the KDE
+  double m1=k1.height;
+  double m2=k2.height;
+  if(merge_split_) {
+    for(unsigned i=0; i<k1.center.size(); i++) {
+      m1*=k1.sigma[i];
+      m2*=k2.sigma[i];
+    }
+  }
+  const double m=m1+m2;
   for(unsigned i=0; i<k1.center.size(); i++) {
     const bool isPeriodic_i=getPntrToArgument(i)->isPeriodic();
     if(isPeriodic_i) {
       k1.center[i]=k2.center[i]+difference(i,k2.center[i],k1.center[i]);  //fix PBC
     }
-    const double w1=k1.height/h;
-    const double w2=k2.height/h;
+    const double w1=m1/m;
+    const double w2=m2/m;
     const double delta=k2.center[i]-k1.center[i];
     const double c_i=k1.center[i]+w2*delta;
     // Merge centered second moments. Subtracting E[x]^2 from E[x^2]
@@ -1715,7 +1769,15 @@ inline void OPESmetad<mode>::mergeKernels(kernel& k1,const kernel& k2) {
     }
     k1.sigma[i]=sqrt(ss_i);
   }
-  k1.height=h;
+  if(merge_split_) {
+    double norm=1;
+    for(unsigned i=0; i<k1.center.size(); i++) {
+      norm*=k1.sigma[i];
+    }
+    k1.height=m/norm;
+  } else {
+    k1.height=m;
+  }
 }
 
 }

@@ -10,7 +10,7 @@ struct Result {
   bool finite=true;
 };
 
-Result evaluate(const std::string& mode, bool shifted, bool moving) {
+Result evaluate(const std::string& mode, const std::string& merge, bool shifted, bool moving) {
   Result result;
   PLMD::Plumed p;
   int precision=8, natoms=2;
@@ -24,11 +24,11 @@ Result evaluate(const std::string& mode, bool shifted, bool moving) {
   p.cmd("readInputLine",shifted ?
         "c: CUSTOM ARG=d FUNC=x+100000000 PERIODIC=NO" :
         "c: CUSTOM ARG=d FUNC=x PERIODIC=NO");
-  const std::string name=mode+(shifted ? "-shifted" : "-unshifted")+
+  const std::string name=mode+"-"+merge+(shifted ? "-shifted" : "-unshifted")+
                          (moving ? "-moving" : "-constant");
   p.cmd("readInputLine",("b: "+mode+
-        " ARG=c PACE=1 BARRIER=10 TEMP=300 SIGMA=0.125 FIXED_SIGMA "
-        "COMPRESSION_THRESHOLD=1 KERNEL_CUTOFF=3 FILE="+name+".kernels").c_str());
+                         " ARG=c PACE=1 BARRIER=10 TEMP=300 SIGMA=0.125 FIXED_SIGMA "
+                         "COMPRESSION_THRESHOLD=1 KERNEL_CUTOFF=3 MERGE_SCHEME="+merge+" FILE="+name+".kernels").c_str());
   std::array<double,6> positions{{0,0,0,1,0,0}}, forces{};
   std::array<double,9> box{{3,0,0,0,3,0,0,0,3}}, virial{};
   std::array<double,2> masses{{1,1}};
@@ -69,25 +69,33 @@ Result evaluate(const std::string& mode, bool shifted, bool moving) {
 int main() {
   std::ofstream output("output"), details("details");
   bool passed=true;
-  for(const std::string mode : {"OPES_METAD","OPES_METAD_EXPLORE"}) {
-    for(bool moving : {false,true}) {
-      const Result reference=evaluate(mode,false,moving);
-      const Result shifted=evaluate(mode,true,moving);
-      details << mode << " moving=" << moving
-              << " reference_finite=" << reference.finite
-              << " shifted_finite=" << shifted.finite << "\n";
-      for(unsigned i=0; i<reference.samples.size(); ++i) {
-        details << i << " " << reference.samples[i] << " "
-                << shifted.samples[i] << "\n";
+  for(const std::string mode : {
+        "OPES_METAD","OPES_METAD_EXPLORE"
+      }) {
+    for(const std::string merge : {
+          "PLAIN","SPLIT"
+        }) {
+      for(bool moving : {
+            false,true
+          }) {
+        const Result reference=evaluate(mode,merge,false,moving);
+        const Result shifted=evaluate(mode,merge,true,moving);
+        details << mode << " MERGE_SCHEME=" << merge << " moving=" << moving
+                << " reference_finite=" << reference.finite
+                << " shifted_finite=" << shifted.finite << "\n";
+        for(unsigned i=0; i<reference.samples.size(); ++i) {
+          details << i << " " << reference.samples[i] << " "
+                  << shifted.samples[i] << "\n";
+        }
+        bool same=reference.finite && shifted.finite;
+        for(unsigned i=0; i<reference.samples.size(); ++i) {
+          same=same && std::abs(reference.samples[i]-shifted.samples[i])<
+               2e-6*(1+std::abs(reference.samples[i]));
+        }
+        output << mode << " MERGE_SCHEME=" << merge << (moving ? " moving" : " constant")
+               << " translation-invariance " << (same ? "PASS" : "FAIL") << "\n";
+        passed=passed && same;
       }
-      bool same=reference.finite && shifted.finite;
-      for(unsigned i=0; i<reference.samples.size(); ++i) {
-        same=same && std::abs(reference.samples[i]-shifted.samples[i])<
-             2e-6*(1+std::abs(reference.samples[i]));
-      }
-      output << mode << (moving ? " moving" : " constant")
-             << " translation-invariance " << (same ? "PASS" : "FAIL") << "\n";
-      passed=passed && same;
     }
   }
   return passed ? 0 : 1;

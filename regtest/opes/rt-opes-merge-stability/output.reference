@@ -1,4 +1,8 @@
-OPES_METAD constant translation-invariance PASS
-OPES_METAD moving translation-invariance PASS
-OPES_METAD_EXPLORE constant translation-invariance PASS
-OPES_METAD_EXPLORE moving translation-invariance PASS
+OPES_METAD MERGE_SCHEME=PLAIN constant translation-invariance PASS
+OPES_METAD MERGE_SCHEME=PLAIN moving translation-invariance PASS
+OPES_METAD MERGE_SCHEME=SPLIT constant translation-invariance PASS
+OPES_METAD MERGE_SCHEME=SPLIT moving translation-invariance PASS
+OPES_METAD_EXPLORE MERGE_SCHEME=PLAIN constant translation-invariance PASS
+OPES_METAD_EXPLORE MERGE_SCHEME=PLAIN moving translation-invariance PASS
+OPES_METAD_EXPLORE MERGE_SCHEME=SPLIT constant translation-invariance PASS
+OPES_METAD_EXPLORE MERGE_SCHEME=SPLIT moving translation-invariance PASS
