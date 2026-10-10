@@ -10,3 +10,8 @@ step, for OPES_METAD and OPES_METAD_EXPLORE. Adaptive sigma gives kernels of dif
 widths, and most of them end up outside the list. The test fails with `NLIST_ZED=PLAIN`
 (Zed updated using only the kernels in the list) and with `NLIST_REBUILD=PLAIN`
 (kernels within the cutoff missed between rebuilds).
+
+The second setting (`merges`) uses a COMPRESSION_THRESHOLD close to KERNEL_CUTOFF and a
+small list (`NLIST_PARAMETERS=1.1,0.2`). After a merge, the merged kernel can then merge
+again with a kernel outside the list, which happens twice with OPES_METAD. The test fails
+if the recursive merges search only the kernels in the list.

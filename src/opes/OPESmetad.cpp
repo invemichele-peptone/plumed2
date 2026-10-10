@@ -247,7 +247,7 @@ private:
   double getProbAndDerivatives(const std::vector<double>&,std::vector<double>&);
   void addKernel(const double,const std::vector<double>&,const std::vector<double>&);
   void addKernel(const double,const std::vector<double>&,const std::vector<double>&,const double); //also print to file
-  unsigned getMergeableKernel(const std::vector<double>&,const unsigned);
+  unsigned getMergeableKernel(const std::vector<double>&,const unsigned,const bool all_kernels=false);
   void updateNlist(const std::vector<double>&);
   void dumpStateToFile();
 
@@ -1400,8 +1400,10 @@ void OPESmetad<mode>::addKernel(const double height,const std::vector<double>& c
       mergeKernels(kernels_[taker_k],kernel(height,center,sigma));
       delta_kernels_.push_back(kernels_[taker_k]);
       if(recursive_merge_) { //the overhead is worth it if it keeps low the total number of kernels
+        //with NLIST_REBUILD=EXACT the list holds all kernels within the cutoff of the current CV, thus also
+        //those that can merge with the new kernel, but the merged kernel has moved: search all kernels
         unsigned giver_k=taker_k;
-        taker_k=getMergeableKernel(kernels_[giver_k].center,giver_k);
+        taker_k=getMergeableKernel(kernels_[giver_k].center,giver_k,nlist_exact_rebuild_);
         while(taker_k<kernels_.size()) {
           delta_kernels_.pop_back();
           delta_kernels_.emplace_back(-1*kernels_[taker_k].height,kernels_[taker_k].center,kernels_[taker_k].sigma);
@@ -1411,23 +1413,22 @@ void OPESmetad<mode>::addKernel(const double height,const std::vector<double>& c
           mergeKernels(kernels_[taker_k],kernels_[giver_k]);
           delta_kernels_.push_back(kernels_[taker_k]);
           kernels_.erase(kernels_.begin()+giver_k);
-          if(nlist_) {
-            unsigned giver_nk=0;
-            bool found_giver=false;
-            for(unsigned nk=0; nk<nlist_index_.size(); nk++) {
-              if(found_giver) {
-                nlist_index_[nk]--;  //all the indexes shift due to erase
-              }
-              if(nlist_index_[nk]==giver_k) {
-                giver_nk=nk;
-                found_giver=true;
+          if(nlist_) { //remove the giver from the sorted list, shift the indexes after it, and make sure the taker is listed
+            std::vector<unsigned> new_nlist_index;
+            new_nlist_index.reserve(nlist_index_.size()+1);
+            for(unsigned k : nlist_index_) {
+              if(k!=giver_k) {
+                new_nlist_index.push_back(k<giver_k?k:k-1);
               }
             }
-            plumed_dbg_massert(found_giver,"problem with merging and NLIST");
-            nlist_index_.erase(nlist_index_.begin()+giver_nk);
+            const auto taker_pos=std::lower_bound(new_nlist_index.begin(),new_nlist_index.end(),taker_k); //taker_k<giver_k
+            if(taker_pos==new_nlist_index.end() || *taker_pos!=taker_k) { //possible only when searching all kernels
+              new_nlist_index.insert(taker_pos,taker_k);
+            }
+            nlist_index_.swap(new_nlist_index);
           }
           giver_k=taker_k;
-          taker_k=getMergeableKernel(kernels_[giver_k].center,giver_k);
+          taker_k=getMergeableKernel(kernels_[giver_k].center,giver_k,nlist_exact_rebuild_);
         }
       }
     }
@@ -1458,71 +1459,41 @@ void OPESmetad<mode>::addKernel(const double height,const std::vector<double>& c
 }
 
 template <class mode>
-unsigned OPESmetad<mode>::getMergeableKernel(const std::vector<double>& giver_center,const unsigned giver_k) {
+unsigned OPESmetad<mode>::getMergeableKernel(const std::vector<double>& giver_center,const unsigned giver_k,const bool all_kernels) {
   //returns kernels_.size() if no match is found
+  //with NLIST only the kernels in the list are searched, unless all_kernels is true
+  const bool use_nlist=(nlist_ && !all_kernels);
+  const unsigned size=use_nlist?nlist_index_.size():kernels_.size();
   unsigned min_k=kernels_.size();
   double min_norm2=threshold2_;
-  if(!nlist_) {
-    #pragma omp parallel num_threads(NumOMP_)
-    {
-      unsigned min_k_omp = min_k;
-      double min_norm2_omp = threshold2_;
-      #pragma omp for nowait
-      for(unsigned k=rank_; k<kernels_.size(); k+=NumParallel_) {
-        if(k==giver_k) { //a kernel should not be merged with itself
-          continue;
-        }
-        double norm2=0;
-        for(unsigned i=0; i<ncv_; i++) {
-          const double dist_i=difference(i,giver_center[i],kernels_[k].center[i])/kernels_[k].sigma[i];
-          norm2+=dist_i*dist_i;
-          if(norm2>=min_norm2_omp) {
-            break;
-          }
-        }
-        if(norm2<min_norm2_omp) {
-          min_norm2_omp=norm2;
-          min_k_omp=k;
+  #pragma omp parallel num_threads(NumOMP_)
+  {
+    unsigned min_k_omp = min_k;
+    double min_norm2_omp = threshold2_;
+    #pragma omp for nowait
+    for(unsigned nk=rank_; nk<size; nk+=NumParallel_) {
+      const unsigned k=use_nlist?nlist_index_[nk]:nk;
+      if(k==giver_k) { //a kernel should not be merged with itself
+        continue;
+      }
+      double norm2=0;
+      for(unsigned i=0; i<ncv_; i++) {
+        const double dist_i=difference(i,giver_center[i],kernels_[k].center[i])/kernels_[k].sigma[i];
+        norm2+=dist_i*dist_i;
+        if(norm2>=min_norm2_omp) {
+          break;
         }
       }
-      #pragma omp critical
-      {
-        if(min_norm2_omp < min_norm2) {
-          min_norm2 = min_norm2_omp;
-          min_k = min_k_omp;
-        }
+      if(norm2<min_norm2_omp) {
+        min_norm2_omp=norm2;
+        min_k_omp=k;
       }
     }
-  } else {
-    #pragma omp parallel num_threads(NumOMP_)
+    #pragma omp critical
     {
-      unsigned min_k_omp = min_k;
-      double min_norm2_omp = threshold2_;
-      #pragma omp for nowait
-      for(unsigned nk=rank_; nk<nlist_index_.size(); nk+=NumParallel_) {
-        const unsigned k=nlist_index_[nk];
-        if(k==giver_k) { //a kernel should not be merged with itself
-          continue;
-        }
-        double norm2=0;
-        for(unsigned i=0; i<ncv_; i++) {
-          const double dist_i=difference(i,giver_center[i],kernels_[k].center[i])/kernels_[k].sigma[i];
-          norm2+=dist_i*dist_i;
-          if(norm2>=min_norm2_omp) {
-            break;
-          }
-        }
-        if(norm2<min_norm2_omp) {
-          min_norm2_omp=norm2;
-          min_k_omp=k;
-        }
-      }
-      #pragma omp critical
-      {
-        if(min_norm2_omp < min_norm2) {
-          min_norm2 = min_norm2_omp;
-          min_k = min_k_omp;
-        }
+      if(min_norm2_omp < min_norm2) {
+        min_norm2 = min_norm2_omp;
+        min_k = min_k_omp;
       }
     }
   }

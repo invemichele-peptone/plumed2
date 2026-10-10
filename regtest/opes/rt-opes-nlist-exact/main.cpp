@@ -10,11 +10,17 @@
 int main() {
   std::ofstream output("output");
   bool all_passed=true;
-  for(const std::string mode : {
-        "OPES_METAD","OPES_METAD_EXPLORE"
-      }) {
-    //adaptive sigma: kernels of different widths, many of them outside the neighbor list
-    const std::string opes=" ARG=d1,d2 PACE=5 BARRIER=20 TEMP=300 CUTOFF_SCHEME=PR";
+  //default: adaptive sigma gives kernels of different widths, many of them outside the neighbor list
+  //merges: with COMPRESSION_THRESHOLD close to KERNEL_CUTOFF and a small list, a recursive merge
+  //can involve a kernel outside the list (name, keywords for both, keywords for the neighbor list)
+  const std::array<std::array<std::string,3>,2> settings{{
+      {{"default","",""}},{{"merges"," KERNEL_CUTOFF=3.5 COMPRESSION_THRESHOLD=3.4"," NLIST_PARAMETERS=1.1,0.2"}}
+    }};
+  for(const auto& setting : settings)
+    for(const std::string mode : {
+          "OPES_METAD","OPES_METAD_EXPLORE"
+        }) {
+    const std::string opes=" ARG=d1,d2 PACE=5 BARRIER=20 TEMP=300 CUTOFF_SCHEME=PR"+setting[1];
     PLMD::Plumed p[2];
     int precision=8, natoms=3;
     double timestep=0.001, kbt=2.4943387854;
@@ -27,8 +33,9 @@ int main() {
       p[n].cmd("readInputLine","d1: DISTANCE ATOMS=1,2 NOPBC");
       p[n].cmd("readInputLine","d2: DISTANCE ATOMS=1,3 NOPBC");
     }
-    p[0].cmd("readInputLine",("b: "+mode+opes+" NLIST NLIST_REBUILD=EXACT NLIST_ZED=FULL FILE="+mode+"-nlist.kernels").c_str());
-    p[1].cmd("readInputLine",("b: "+mode+opes+" FILE="+mode+"-ref.kernels").c_str());
+    const std::string files=mode+"-"+setting[0];
+    p[0].cmd("readInputLine",("b: "+mode+opes+" NLIST NLIST_REBUILD=EXACT NLIST_ZED=FULL"+setting[2]+" FILE="+files+"-nlist.kernels").c_str());
+    p[1].cmd("readInputLine",("b: "+mode+opes+" FILE="+files+"-ref.kernels").c_str());
     std::mt19937 rng(12345);
     auto uniform=[&]() {
       return rng()/4294967296.0-0.5;
@@ -62,7 +69,7 @@ int main() {
     }
     const bool passed=max_dbias<1e-9 && max_dforce<1e-9;
     all_passed=all_passed && passed;
-    output<<mode<<" exact neighbor list "<<(passed ? "PASS" : "FAIL")<<"\n";
+    output<<mode<<" "<<setting[0]<<": exact neighbor list "<<(passed ? "PASS" : "FAIL")<<"\n";
   }
   return all_passed ? 0 : 1;
 }
