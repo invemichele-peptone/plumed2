@@ -215,8 +215,17 @@ private:
   double val_at_cutoff_;
   void mergeKernels(kernel&,const kernel&); //merge the second one into the first one
   double evaluateKernel(const kernel&,const std::vector<double>&) const;
-  double evaluateKernel(const kernel&,const std::vector<double>&,std::vector<double>&,std::vector<double>&);
   std::vector<kernel> kernels_; //all compressed kernels
+//kernels summed at every step (all of them, or those in the neighbor list), with each CV in a
+//contiguous array, so that the distances to all of them are computed in a loop without branches
+  bool sum_outdated_; //kernels_ or nlist_index_ changed since the last updateSum()
+  std::vector<double> sum_center_; //CV i of the k-th summed kernel is sum_center_[i*size+k]
+  std::vector<double> sum_inv_sigma_; //same layout, inverse of sigma
+  std::vector<double> sum_height_;
+  std::vector<double> period_; //period of each CV, zero if not periodic
+  std::vector<double> inv_period_;
+  void updateSum();
+  void sumKernels(const std::vector<double>&,const unsigned,const unsigned,double&,std::vector<double>&) const;
   OFile kernelsOfile_;
 //neighbour list stuff
   bool nlist_;
@@ -550,6 +559,17 @@ OPESmetad<mode>::OPESmetad(const ActionOptions& ao)
   parse("NLIST_ZED",nlist_zed);
   plumed_massert(nlist_zed=="PLAIN" || nlist_zed=="FULL","NLIST_ZED must be PLAIN or FULL");
   nlist_full_zed_=(nlist_zed=="FULL");
+
+//setup the sum of the kernels
+  sum_outdated_=true;
+  period_.resize(ncv_,0.);
+  inv_period_.resize(ncv_,0.);
+  for(unsigned i=0; i<ncv_; i++) {
+    if(getPntrToArgument(i)->isPeriodic()) {
+      period_[i]=getPntrToArgument(i)->getMaxMinusMin();
+      inv_period_[i]=1./period_[i];
+    }
+  }
 
 //optional stuff
   no_Zed_=false;
@@ -1227,6 +1247,7 @@ void OPESmetad<mode>::update() {
           comm.Bcast(all_nlist_index,0);
           std::set<unsigned> nlist_index_set(all_nlist_index.begin(),all_nlist_index.end()); //remove duplicates and sort
           nlist_index_.assign(nlist_index_set.begin(),nlist_index_set.end());
+          sum_outdated_=true;
         }
       }
       for(unsigned w=0; w<NumWalkers_; w++) {
@@ -1328,48 +1349,32 @@ void OPESmetad<mode>::update() {
 
 template <class mode>
 double OPESmetad<mode>::getProbAndDerivatives(const std::vector<double>& cv,std::vector<double>& der_prob) {
+  if(sum_outdated_) {
+    updateSum();
+  }
+  //each MPI process sums a contiguous share of the kernels, split in blocks among the OpenMP threads
+  const unsigned size=sum_height_.size();
+  const unsigned share=(size+NumParallel_-1)/NumParallel_;
+  const unsigned begin=std::min(rank_*share,size);
+  const unsigned end=std::min(begin+share,size);
+  constexpr unsigned omp_block=64;
   double prob=0.0;
-  if(!nlist_) {
-    if(NumOMP_==1 || (unsigned)kernels_.size()<2*NumOMP_*NumParallel_) {
-      // for performances and thread safety
-      std::vector<double> dist(ncv_);
-      for(unsigned k=rank_; k<kernels_.size(); k+=NumParallel_) {
-        prob+=evaluateKernel(kernels_[k],cv,der_prob,dist);
-      }
-    } else {
-      #pragma omp parallel num_threads(NumOMP_)
-      {
-        std::vector<double> omp_deriv(der_prob.size(),0.);
-        // for performances and thread safety
-        std::vector<double> dist(ncv_);
-        #pragma omp for reduction(+:prob) nowait
-        for(unsigned k=rank_; k<kernels_.size(); k+=NumParallel_) {
-          prob+=evaluateKernel(kernels_[k],cv,omp_deriv,dist);
-        }
-        #pragma omp critical
-        for(unsigned i=0; i<ncv_; i++) {
-          der_prob[i]+=omp_deriv[i];
-        }
-      }
-    }
+  if(NumOMP_==1 || end-begin<2*NumOMP_*omp_block) {
+    sumKernels(cv,begin,end,prob,der_prob);
   } else {
-    if(NumOMP_==1 || (unsigned)nlist_index_.size()<2*NumOMP_*NumParallel_) {
-      // for performances and thread safety
-      std::vector<double> dist(ncv_);
-      for(unsigned nk=rank_; nk<nlist_index_.size(); nk+=NumParallel_) {
-        prob+=evaluateKernel(kernels_[nlist_index_[nk]],cv,der_prob,dist);
+    const unsigned nblocks=(end-begin+omp_block-1)/omp_block;
+    #pragma omp parallel num_threads(NumOMP_)
+    {
+      double omp_prob=0;
+      std::vector<double> omp_deriv(ncv_,0.);
+      #pragma omp for nowait
+      for(unsigned n=0; n<nblocks; n++) {
+        const unsigned b=begin+n*omp_block;
+        sumKernels(cv,b,std::min(b+omp_block,end),omp_prob,omp_deriv);
       }
-    } else {
-      #pragma omp parallel num_threads(NumOMP_)
+      #pragma omp critical
       {
-        std::vector<double> omp_deriv(der_prob.size(),0.);
-        // for performances and thread safety
-        std::vector<double> dist(ncv_);
-        #pragma omp for reduction(+:prob) nowait
-        for(unsigned nk=rank_; nk<nlist_index_.size(); nk+=NumParallel_) {
-          prob+=evaluateKernel(kernels_[nlist_index_[nk]],cv,omp_deriv,dist);
-        }
-        #pragma omp critical
+        prob+=omp_prob;
         for(unsigned i=0; i<ncv_; i++) {
           der_prob[i]+=omp_deriv[i];
         }
@@ -1390,7 +1395,102 @@ double OPESmetad<mode>::getProbAndDerivatives(const std::vector<double>& cv,std:
 }
 
 template <class mode>
+void OPESmetad<mode>::updateSum() {
+  const unsigned size=nlist_?nlist_index_.size():kernels_.size();
+  sum_center_.resize(ncv_*size);
+  sum_inv_sigma_.resize(ncv_*size);
+  sum_height_.resize(size);
+  for(unsigned k=0; k<size; k++) {
+    const kernel& G=kernels_[nlist_?nlist_index_[k]:k];
+    sum_height_[k]=G.height;
+    for(unsigned i=0; i<ncv_; i++) {
+      sum_center_[i*size+k]=G.center[i];
+      sum_inv_sigma_[i*size+k]=1./G.sigma[i];
+    }
+  }
+  sum_outdated_=false;
+}
+
+//nearest integer, without branches: a single instruction on aarch64 and on x86 with SSE4.1,
+//otherwise a conversion to int, valid for |x|<100 (here |x|<1, since x is a distance over the period)
+static inline double nearestInteger(const double x) {
+#if defined(__aarch64__) || defined(__SSE4_1__)
+  return std::nearbyint(x);
+#else
+  return static_cast<int>(x+100.5)-100;
+#endif
+}
+
+template <class mode>
+void OPESmetad<mode>::sumKernels(const std::vector<double>& cv,const unsigned begin,const unsigned end,double& prob,std::vector<double>& der_prob) const {
+  //adds the summed kernels from begin to end to prob and der_prob (not normalized).
+  //For a block of kernels, the squared distances are first computed for all of them, without branches,
+  //then only the few within the cutoff are evaluated. The result is the same as summing one kernel at a time
+  constexpr unsigned block=128;
+  double norm2[block];
+  const unsigned size=sum_height_.size();
+  for(unsigned b=begin; b<end; b+=block) {
+    const unsigned nb=std::min(block,end-b);
+    for(unsigned k=0; k<nb; k++) {
+      norm2[k]=0;
+    }
+    for(unsigned i=0; i<ncv_; i++) {
+      const double* center_i=&sum_center_[i*size+b];
+      const double* inv_sigma_i=&sum_inv_sigma_[i*size+b];
+      const double cv_i=cv[i];
+      if(period_[i]>0) {
+        const double period=period_[i];
+        const double inv_period=inv_period_[i];
+        for(unsigned k=0; k<nb; k++) {
+          double diff=cv_i-center_i[k];
+          diff-=period*nearestInteger(diff*inv_period);
+          const double dist=diff*inv_sigma_i[k];
+          norm2[k]+=dist*dist;
+        }
+      } else {
+        for(unsigned k=0; k<nb; k++) {
+          const double dist=(cv_i-center_i[k])*inv_sigma_i[k];
+          norm2[k]+=dist*dist;
+        }
+      }
+    }
+    for(unsigned k=0; k<nb; k++) {
+      if(norm2[k]>=cutoff2_) {
+        continue;
+      }
+      //with c=exp(-rc2/2), the energy-shifted kernel is G*(exp(-r2/2)-c) and the force-shifted one is
+      //G*(exp(-r2/2)-c*(1+(rc2-r2)/2)), whose derivative -G*(exp(-r2/2)-c)*dr2/2 vanishes at the cutoff
+      const double height=sum_height_[b+k];
+      double val, der_val;
+      switch(cutoff_scheme_) {
+      case cutoffScheme::pr: //energy-shifted value and its exact derivative
+        der_val=height*std::exp(-0.5*norm2[k]);
+        val=der_val-height*val_at_cutoff_;
+        break;
+      case cutoffScheme::alternative: //force-shifted value and its exact derivative
+        der_val=height*(std::exp(-0.5*norm2[k])-val_at_cutoff_);
+        val=der_val-height*val_at_cutoff_*0.5*(cutoff2_-norm2[k]);
+        break;
+      default: //energy-shifted value, derivative of the force-shifted kernel
+        val=height*(std::exp(-0.5*norm2[k])-val_at_cutoff_);
+        der_val=val;
+      }
+      prob+=val;
+      for(unsigned i=0; i<ncv_; i++) {
+        double diff=cv[i]-sum_center_[i*size+b+k];
+        if(period_[i]>0) {
+          diff-=period_[i]*nearestInteger(diff*inv_period_[i]);
+        }
+        const double inv_sigma=sum_inv_sigma_[i*size+b+k];
+        der_prob[i]-=diff*inv_sigma*inv_sigma*der_val;
+      }
+    }
+  }
+}
+
+template <class mode>
 void OPESmetad<mode>::addKernel(const double height,const std::vector<double>& center,const std::vector<double>& sigma) {
+  sum_outdated_=true;
   bool no_match=true;
   if(threshold2_!=0) {
     unsigned taker_k=getMergeableKernel(center,kernels_.size());
@@ -1618,6 +1718,7 @@ void OPESmetad<mode>::updateNlist(const std::vector<double>& new_center) {
   getPntrToComponent("nlsteps")->set(nlist_steps_);
   nlist_steps_=0;
   nlist_update_=false;
+  sum_outdated_=true;
 }
 
 template <class mode>
@@ -1744,39 +1845,6 @@ inline double OPESmetad<mode>::evaluateKernel(const kernel& G,const std::vector<
     return G.height*(std::exp(-0.5*norm2)-val_at_cutoff_*(1+0.5*(cutoff2_-norm2)));
   }
   return G.height*(std::exp(-0.5*norm2)-val_at_cutoff_); //energy-shifted Gaussian
-}
-
-template <class mode>
-inline double OPESmetad<mode>::evaluateKernel(const kernel& G,const std::vector<double>& x, std::vector<double>& acc_der, std::vector<double>& dist) {
-  //NB: cannot be a method of kernel class, because uses external variables (for cutoff)
-  double norm2=0;
-  for(unsigned i=0; i<ncv_; i++) {
-    dist[i]=difference(i,G.center[i],x[i])/G.sigma[i];
-    norm2+=dist[i]*dist[i];
-    if(norm2>=cutoff2_) {
-      return 0;
-    }
-  }
-  //with c=exp(-rc2/2), the energy-shifted kernel is G*(exp(-r2/2)-c) and the force-shifted one is
-  //G*(exp(-r2/2)-c*(1+(rc2-r2)/2)), whose derivative -G*(exp(-r2/2)-c)*dr2/2 vanishes at the cutoff
-  double val, der_val;
-  switch(cutoff_scheme_) {
-  case cutoffScheme::pr: //energy-shifted value and its exact derivative
-    der_val=G.height*std::exp(-0.5*norm2);
-    val=der_val-G.height*val_at_cutoff_;
-    break;
-  case cutoffScheme::alternative: //force-shifted value and its exact derivative
-    der_val=G.height*(std::exp(-0.5*norm2)-val_at_cutoff_);
-    val=der_val-G.height*val_at_cutoff_*0.5*(cutoff2_-norm2);
-    break;
-  default: //energy-shifted value, derivative of the force-shifted kernel
-    val=G.height*(std::exp(-0.5*norm2)-val_at_cutoff_);
-    der_val=val;
-  }
-  for(unsigned i=0; i<ncv_; i++) {
-    acc_der[i]-=dist[i]/G.sigma[i]*der_val;  //NB: we accumulate the derivative into der
-  }
-  return val;
 }
 
 template <class mode>
