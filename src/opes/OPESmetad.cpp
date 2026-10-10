@@ -227,6 +227,10 @@ private:
   unsigned nlist_steps_;
   bool nlist_update_;
   bool nlist_pace_reset_;
+  bool nlist_exact_rebuild_; //rebuild before a kernel outside the list can get within the cutoff
+  double nlist_skin2_; //square of the largest displacement allowed, in units of nlist_sigma_min_
+  std::vector<double> nlist_sigma_min_; //smallest sigma of all kernels, for each CV, at the last rebuild
+  bool nlist_full_zed_; //update Zed with all the kernels, not only those in the list
 
   bool calc_work_;
   double work_;
@@ -345,6 +349,13 @@ void OPESmetad<mode>::registerKeywords(Keywords& keys) {
   keys.add("optional","NLIST_PARAMETERS","( default=3.0,0.5 ) the two cutoff parameters for the kernels neighbor list");
   keys.addFlag("NLIST",false,"use neighbor list for kernels summation, faster but experimental");
   keys.addFlag("NLIST_PACE_RESET",false,"force the reset of the neighbor list at each PACE. Can be useful with WALKERS_MPI");
+  keys.add("compulsory","NLIST_REBUILD","PLAIN","when to rebuild the neighbor list. "
+           "PLAIN: when the CV moves by more than a fraction of the spread of the listed kernels (v2.9). "
+           "EXACT: before any kernel outside the list can get within KERNEL_CUTOFF, i.e. when the displacement "
+           "from the list center, in units of the smallest sigma of the kernels, "
+           "exceeds (sqrt(NLIST_PARAMETERS[0])-1)*KERNEL_CUTOFF");
+  keys.add("compulsory","NLIST_ZED","PLAIN","which kernels are used to update Zed when using the neighbor list. "
+           "PLAIN: only those in the list (v2.9). FULL: all of them, so that Zed is exact");
   keys.addFlag("FIXED_SIGMA",false,"do not decrease sigma as the simulation proceeds. Can be added in a RESTART, to keep in check the number of compressed kernels");
   keys.addFlag("RECURSIVE_MERGE_OFF",false,"do not recursively attempt kernel merging when a new one is added");
   keys.addFlag("NO_ZED",false,"do not normalize over the explored CV space, Z_n=1");
@@ -529,6 +540,16 @@ OPESmetad<mode>::OPESmetad(const ActionOptions& ao)
   nlist_dev2_.resize(ncv_,0.);
   nlist_steps_=0;
   nlist_update_=true;
+  std::string nlist_rebuild;
+  parse("NLIST_REBUILD",nlist_rebuild);
+  plumed_massert(nlist_rebuild=="PLAIN" || nlist_rebuild=="EXACT","NLIST_REBUILD must be PLAIN or EXACT");
+  nlist_exact_rebuild_=(nlist_rebuild=="EXACT");
+  nlist_skin2_=std::pow(std::sqrt(nlist_param_[0])-1,2)*cutoff2_;
+  nlist_sigma_min_.resize(ncv_,std::numeric_limits<double>::max());
+  std::string nlist_zed;
+  parse("NLIST_ZED",nlist_zed);
+  plumed_massert(nlist_zed=="PLAIN" || nlist_zed=="FULL","NLIST_ZED must be PLAIN or FULL");
+  nlist_full_zed_=(nlist_zed=="FULL");
 
 //optional stuff
   no_Zed_=false;
@@ -937,6 +958,7 @@ OPESmetad<mode>::OPESmetad(const ActionOptions& ao)
   }
   if(nlist_) {
     log.printf(" -- NLIST: using neighbor list for kernels, with parameters: %g,%g\n",nlist_param_[0],nlist_param_[1]);
+    log.printf("    NLIST_REBUILD = %s, NLIST_ZED = %s\n",nlist_exact_rebuild_?"EXACT":"PLAIN",nlist_full_zed_?"FULL":"PLAIN");
   }
   if(nlist_pace_reset_) {
     log.printf(" -- NLIST_PACE_RESET: forcing the neighbor list to update every PACE\n");
@@ -996,6 +1018,16 @@ void OPESmetad<mode>::calculate() {
     nlist_steps_++;
     if(getExchangeStep()) {
       nlist_update_=true;
+    } else if(nlist_exact_rebuild_) {
+      //kernels outside the list cannot be within the cutoff as long as this displacement is within the skin
+      double norm2=0;
+      for(unsigned i=0; i<ncv_; i++) {
+        const double dist_i=difference(i,nlist_center_[i],cv[i])/nlist_sigma_min_[i];
+        norm2+=dist_i*dist_i;
+      }
+      if(norm2>nlist_skin2_) {
+        nlist_update_=true;
+      }
     } else {
       for(unsigned i=0; i<ncv_; i++) {
         const double diff_i=difference(i,cv[i],nlist_center_[i]);
@@ -1227,7 +1259,7 @@ void OPESmetad<mode>::update() {
         // uprob = old_uprob + delta_uprob
         // and we also need to consider that in the new sum there are some novel centers and some disappeared ones
         double delta_sum_uprob=0;
-        if(!nlist_) {
+        if(!nlist_ || nlist_full_zed_) {
           #pragma omp parallel num_threads(NumOMP_)
           {
             #pragma omp for reduction(+:delta_sum_uprob) nowait
@@ -1506,6 +1538,9 @@ void OPESmetad<mode>::updateNlist(const std::vector<double>& new_center) {
 
   nlist_center_=new_center;
   nlist_index_.clear();
+  //smallest sigma of all kernels: it bounds the distance of the kernels outside the list from below.
+  //Using only those outside would never trigger a rebuild when all kernels are in the list
+  std::vector<double> sigma_min(ncv_,std::numeric_limits<double>::max());
   //first we gather all the nlist_index
   if(NumOMP_==1 || (unsigned)kernels_.size()<2*NumOMP_*NumParallel_) {
     for(unsigned k=rank_; k<kernels_.size(); k+=NumParallel_) {
@@ -1517,11 +1552,17 @@ void OPESmetad<mode>::updateNlist(const std::vector<double>& new_center) {
       if(norm2_k<=nlist_param_[0]*cutoff2_) {
         nlist_index_.push_back(k);
       }
+      if(nlist_exact_rebuild_) {
+        for(unsigned i=0; i<ncv_; i++) {
+          sigma_min[i]=std::min(sigma_min[i],kernels_[k].sigma[i]);
+        }
+      }
     }
   } else {
     #pragma omp parallel num_threads(NumOMP_)
     {
       std::vector<unsigned> private_nlist_index;
+      std::vector<double> private_sigma_min(ncv_,std::numeric_limits<double>::max());
       #pragma omp for nowait
       for(unsigned k=rank_; k<kernels_.size(); k+=NumParallel_) {
         double norm2_k=0;
@@ -1532,9 +1573,19 @@ void OPESmetad<mode>::updateNlist(const std::vector<double>& new_center) {
         if(norm2_k<=nlist_param_[0]*cutoff2_) {
           private_nlist_index.push_back(k);
         }
+        if(nlist_exact_rebuild_) {
+          for(unsigned i=0; i<ncv_; i++) {
+            private_sigma_min[i]=std::min(private_sigma_min[i],kernels_[k].sigma[i]);
+          }
+        }
       }
       #pragma omp critical
-      nlist_index_.insert(nlist_index_.end(),private_nlist_index.begin(),private_nlist_index.end());
+      {
+        nlist_index_.insert(nlist_index_.end(),private_nlist_index.begin(),private_nlist_index.end());
+        for(unsigned i=0; i<ncv_; i++) {
+          sigma_min[i]=std::min(sigma_min[i],private_sigma_min[i]);
+        }
+      }
     }
     if(recursive_merge_) {
       std::sort(nlist_index_.begin(),nlist_index_.end());
@@ -1560,6 +1611,12 @@ void OPESmetad<mode>::updateNlist(const std::vector<double>& new_center) {
         std::sort(nlist_index_.begin(),nlist_index_.end());
       }
     }
+  }
+  if(nlist_exact_rebuild_) {
+    if(NumParallel_>1) {
+      comm.Min(sigma_min);
+    }
+    nlist_sigma_min_=sigma_min;
   }
   //calculate the square deviation
   std::vector<double> dev2(ncv_,0.);
