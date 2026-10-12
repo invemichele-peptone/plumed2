@@ -27,6 +27,16 @@
 namespace PLMD {
 namespace opes {
 
+//nearest integer, without branches: a single instruction on aarch64 and on x86 with SSE4.1,
+//otherwise a conversion to int, valid for |x|<100 (here |x|<1, since x is a distance over the period)
+static inline double nearestInteger(const double x) {
+#if defined(__aarch64__) || defined(__SSE4_1__)
+  return std::nearbyint(x);
+#else
+  return static_cast<int>(x+100.5)-100;
+#endif
+}
+
 //+PLUMEDOC OPES_BIAS OPES_METAD
 /*
 On-the-fly probability enhanced sampling with metadynamics-like target distribution.
@@ -225,6 +235,8 @@ private:
   std::vector<double> sum_height_;
   std::vector<double> period_; //period of each CV, zero if not periodic
   std::vector<double> inv_period_;
+  std::vector<double> cv_; //buffers for calculate(), to avoid allocations at every step
+  std::vector<double> der_prob_;
   void updateSum();
   void sumKernels(const std::vector<double>&,const unsigned,const unsigned,double&,std::vector<double>&) const;
   OFile kernelsOfile_;
@@ -575,6 +587,8 @@ OPESmetad<mode>::OPESmetad(const ActionOptions& ao)
   sum_outdated_=true;
   period_.resize(ncv_,0.);
   inv_period_.resize(ncv_,0.);
+  cv_.resize(ncv_);
+  der_prob_.resize(ncv_);
   for(unsigned i=0; i<ncv_; i++) {
     if(getPntrToArgument(i)->isPeriodic()) {
       period_[i]=getPntrToArgument(i)->getMaxMinusMin();
@@ -819,15 +833,27 @@ OPESmetad<mode>::OPESmetad(const ActionOptions& ao)
         }
         KDEnorm_=mode::explore?counter_:sum_weights_;
         if(!no_Zed_) {
+          //all kernels evaluated at all centers, with the kernel sum used for the bias (nlist_ is off here).
+          //Each MPI process takes a contiguous share of the centers, split among the OpenMP threads
+          updateSum();
+          const unsigned size=kernels_.size();
+          const unsigned share=(size+NumParallel_-1)/NumParallel_;
+          const unsigned begin=std::min(rank_*share,size);
+          const unsigned end=std::min(begin+share,size);
           double sum_uprob=0;
-          for(unsigned k=rank_; k<kernels_.size(); k+=NumParallel_)
-            for(unsigned kk=0; kk<kernels_.size(); kk++) {
-              sum_uprob+=evaluateKernel(kernels_[kk],kernels_[k].center);
+          #pragma omp parallel num_threads(NumOMP_)
+          {
+            std::vector<double> dummy(ncv_); //derivatives are not needed
+            #pragma omp for reduction(+:sum_uprob) nowait
+            for(unsigned k=begin; k<end; k++) {
+              sumKernels(kernels_[k].center,0,size,sum_uprob,dummy);
             }
+          }
           if(NumParallel_>1) {
             comm.Sum(sum_uprob);
           }
           Zed_=sum_uprob/KDEnorm_/kernels_.size();
+          sum_outdated_=true; //the neighbor list, if any, is not set yet
         }
         log.printf("    a total of %llu kernels where read, and compressed to %lu\n",counter_-1,kernels_.size());
         convertKernelsToState=true;
@@ -1046,7 +1072,7 @@ OPESmetad<mode>::OPESmetad(const ActionOptions& ao)
 template <class mode>
 void OPESmetad<mode>::calculate() {
 //get cv
-  std::vector<double> cv(ncv_);
+  std::vector<double>& cv=cv_;
   for(unsigned i=0; i<ncv_; i++) {
     cv[i]=getArgument(i);
   }
@@ -1060,7 +1086,9 @@ void OPESmetad<mode>::calculate() {
       //kernels outside the list cannot be within the cutoff as long as this displacement is within the skin
       double norm2=0;
       for(unsigned i=0; i<ncv_; i++) {
-        const double dist_i=difference(i,nlist_center_[i],cv[i])/nlist_sigma_min_[i];
+        double diff=cv[i]-nlist_center_[i];
+        diff-=period_[i]*nearestInteger(diff*inv_period_[i]); //zero for non-periodic CVs
+        const double dist_i=diff/nlist_sigma_min_[i];
         norm2+=dist_i*dist_i;
       }
       if(norm2>nlist_skin2_) {
@@ -1081,7 +1109,8 @@ void OPESmetad<mode>::calculate() {
   }
 
 //set bias and forces
-  std::vector<double> der_prob(ncv_,0);
+  std::vector<double>& der_prob=der_prob_;
+  std::fill(der_prob.begin(),der_prob.end(),0.);
   const double prob=getProbAndDerivatives(cv,der_prob);
   const double bias=kbt_*bias_prefactor_*std::log(prob/Zed_+epsilon_);
   setBias(bias);
@@ -1423,16 +1452,6 @@ void OPESmetad<mode>::updateSum() {
     }
   }
   sum_outdated_=false;
-}
-
-//nearest integer, without branches: a single instruction on aarch64 and on x86 with SSE4.1,
-//otherwise a conversion to int, valid for |x|<100 (here |x|<1, since x is a distance over the period)
-static inline double nearestInteger(const double x) {
-#if defined(__aarch64__) || defined(__SSE4_1__)
-  return std::nearbyint(x);
-#else
-  return static_cast<int>(x+100.5)-100;
-#endif
 }
 
 template <class mode>
