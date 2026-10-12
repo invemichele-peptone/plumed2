@@ -247,15 +247,18 @@ for n in range(len(fields_pos)-1):
       der_prob_x=np.zeros(grid_bin_x)
     for i in range(grid_bin_x):
       print('   working...  {:.0%} of '.format(i/grid_bin_x),end='\r')
-      if period_x==0:
-        dist_x=(grid_cv_x[i]-center_x)/sigma_x
-      else:
-        dx=np.absolute(grid_cv_x[i]-center_x)
-        dist_x=np.minimum(dx,period_x-dx)/sigma_x
-      kernels_i=height*(np.maximum(np.exp(-0.5*dist_x*dist_x)-val_at_cutoff,0))
+      dx=grid_cv_x[i]-center_x
+      if period_x!=0:
+        dx-=period_x*np.round(dx/period_x)
+      dist_x=dx/sigma_x
+      dist2=dist_x**2
+      inside=(dist2<cutoff**2)
+      # force-shifted kernels, zero beyond the cutoff
+      kernels_i=height*np.where(inside,np.exp(-0.5*dist2)-val_at_cutoff*(1+0.5*(cutoff**2-dist2)),0)
       prob[i]=np.sum(kernels_i)/Zed+epsilon
       if calc_der:
-        der_prob_x[i]=np.sum(-dist_x/sigma_x*kernels_i)/Zed
+        der_kernels_i=height*np.where(inside,np.exp(-0.5*dist2)-val_at_cutoff,0)
+        der_prob_x[i]=np.sum(-dist_x/sigma_x*der_kernels_i)/Zed
       if mintozero and prob[i]>max_prob:
         max_prob=prob[i]
   else:
@@ -266,21 +269,23 @@ for n in range(len(fields_pos)-1):
     for i in range(grid_bin_y):
       print('   working...  {:.0%} of '.format(i/grid_bin_y),end='\r')
       for j in range(grid_bin_x):
-        if period_x==0:
-          dist_x=(x[i,j]-center_x)/sigma_x
-        else:
-          dx=np.absolute(x[i,j]-center_x)
-          dist_x=np.minimum(dx,period_x-dx)/sigma_x
-        if period_y==0:
-          dist_y=(y[i,j]-center_y)/sigma_y
-        else:
-          dy=np.absolute(y[i,j]-center_y)
-          dist_y=np.minimum(dy,period_y-dy)/sigma_y
-        kernels_ij=height*(np.maximum(np.exp(-0.5*(dist_x**2+dist_y**2))-val_at_cutoff,0))
+        dx=x[i,j]-center_x
+        if period_x!=0:
+          dx-=period_x*np.round(dx/period_x)
+        dist_x=dx/sigma_x
+        dy=y[i,j]-center_y
+        if period_y!=0:
+          dy-=period_y*np.round(dy/period_y)
+        dist_y=dy/sigma_y
+        dist2=dist_x**2+dist_y**2
+        inside=(dist2<cutoff**2)
+        # force-shifted kernels, zero beyond the cutoff
+        kernels_ij=height*np.where(inside,np.exp(-0.5*dist2)-val_at_cutoff*(1+0.5*(cutoff**2-dist2)),0)
         prob[i,j]=np.sum(kernels_ij)/Zed+epsilon
         if calc_der:
-          der_prob_x[i,j]=np.sum(-dist_x/sigma_x*kernels_ij)/Zed
-          der_prob_y[i,j]=np.sum(-dist_y/sigma_y*kernels_ij)/Zed
+          der_kernels_ij=height*np.where(inside,np.exp(-0.5*dist2)-val_at_cutoff,0)
+          der_prob_x[i,j]=np.sum(-dist_x/sigma_x*der_kernels_ij)/Zed
+          der_prob_y[i,j]=np.sum(-dist_y/sigma_y*der_kernels_ij)/Zed
         if mintozero and prob[i,j]>max_prob:
           max_prob=prob[i,j]
   if not mintozero:
